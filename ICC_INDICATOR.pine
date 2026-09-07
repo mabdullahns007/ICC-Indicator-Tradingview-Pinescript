@@ -1,0 +1,186 @@
+// built with PineScript Agents by TradersPost
+// TradesBySci ICC Method Indicator
+// Codifies the "Indication -> Correction -> Continuation" market-structure
+// method from the TradesBySci trading course:
+//   - Market Structure: swing highs/lows classified as HH/HL/LH/LL/EQH/EQL
+//   - Indication: a break of the last opposing swing level
+//   - Correction: the pullback that follows, tracked to its extreme
+//   - Continuation: price crossing back through the indication level a
+//     second time, targeting the origin level of the move
+// Source: https://github.com/mabdullahns007/tradesbysci-trading-course-okf
+//@version=6
+indicator(title="TradesBySci ICC Method", shorttitle="TBS-ICC", overlay=true, max_bars_back=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+pivotLen = input.int(5, "Swing Pivot Length", minval=1, maxval=50, group="Market Structure",
+     tooltip="Bars on each side required to confirm a swing high/low. Matches the 1H/4H structure the course marks up. Lower it on lower timeframes.")
+eqTolerancePct = input.float(0.05, "Equal High/Low Tolerance %", minval=0.0, maxval=5.0, step=0.01, group="Market Structure",
+     tooltip="Two swings within this % of each other are treated as Equal High/Low (indecision / no-trade zone) instead of a new HH/LH or HL/LL.")
+showSwingLabels = input.bool(true, "Show HH/HL/LH/LL/EQH/EQL Labels", group="Market Structure")
+showStructureLine = input.bool(true, "Show Active Swing High/Low Lines", group="Market Structure")
+
+showIndication = input.bool(true, "Show Indication Breaks", group="Indication / Correction / Continuation")
+showCorrectionZone = input.bool(true, "Shade Correction Zone", group="Indication / Correction / Continuation")
+showContinuation = input.bool(true, "Show Continuation (2nd Push) Signals", group="Indication / Correction / Continuation")
+showTargets = input.bool(true, "Show Origin Target Level", group="Indication / Correction / Continuation")
+
+showSessionBg = input.bool(true, "Highlight Trading Session", group="Session")
+sessionString = input.session("0700-1600", "Session Window (exchange time)", group="Session",
+     tooltip="Default is a London-session-style window. TradesBySci notes structure outside normal session hours can be unreliable \"fake volume\".")
+sessionColor = input.color(color.new(color.blue, 92), "Session Background Color", group="Session")
+
+bullColor = input.color(color.new(color.teal, 0), "Bullish Color", group="Visuals")
+bearColor = input.color(color.new(color.red, 0), "Bearish Color", group="Visuals")
+neutralColor = input.color(color.new(color.gray, 0), "Neutral / EQ Color", group="Visuals")
+
+// ============================================================================
+// MARKET STRUCTURE ENGINE (Indication / Correction state machine)
+// ============================================================================
+
+f_structure(int len, float eqTolPct) =>
+    var float swingHigh = na
+    var float swingLow = na
+    var float originLevel = na
+    var float indicationLevel = na
+    var int bias = 0
+    var float correctionExtreme = na
+
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+
+    bullBreak = not na(swingHigh) and ta.crossover(close, swingHigh)
+    bearBreak = not na(swingLow) and ta.crossunder(close, swingLow)
+
+    newIndication = false
+    if bullBreak and bias <= 0
+        originLevel := swingLow
+        indicationLevel := swingHigh
+        bias := 1
+        correctionExtreme := na
+        newIndication := true
+    if bearBreak and bias >= 0
+        originLevel := swingHigh
+        indicationLevel := swingLow
+        bias := -1
+        correctionExtreme := na
+        newIndication := true
+
+    if bias == 1
+        correctionExtreme := na(correctionExtreme) ? low : math.min(correctionExtreme, low)
+    else if bias == -1
+        correctionExtreme := na(correctionExtreme) ? high : math.max(correctionExtreme, high)
+
+    phClass = ""
+    if not na(ph)
+        diffPctH = na(swingHigh) ? 100.0 : math.abs(ph - swingHigh) / swingHigh * 100.0
+        phClass := na(swingHigh) ? "H" : diffPctH <= eqTolPct ? "EQH" : ph > swingHigh ? "HH" : "LH"
+        swingHigh := ph
+
+    plClass = ""
+    if not na(pl)
+        diffPctL = na(swingLow) ? 100.0 : math.abs(pl - swingLow) / swingLow * 100.0
+        plClass := na(swingLow) ? "L" : diffPctL <= eqTolPct ? "EQL" : pl > swingLow ? "HL" : "LL"
+        swingLow := pl
+
+    [bias, indicationLevel, originLevel, correctionExtreme, newIndication, ph, pl, phClass, plClass, swingHigh, swingLow]
+
+[bias, indicationLevel, originLevel, correctionExtreme, newIndication, ph, pl, phClass, plClass, swingHigh, swingLow] =
+     f_structure(pivotLen, eqTolerancePct)
+
+// ---- Continuation ("2nd push") detection ----
+var bool pendingContinuation = false
+var bool correctionStarted = false
+
+if newIndication
+    pendingContinuation := true
+    correctionStarted := false
+
+if pendingContinuation and bias == 1 and close < indicationLevel
+    correctionStarted := true
+if pendingContinuation and bias == -1 and close > indicationLevel
+    correctionStarted := true
+
+continuationLong = pendingContinuation and correctionStarted and not newIndication and bias == 1 and ta.crossover(close, indicationLevel)
+continuationShort = pendingContinuation and correctionStarted and not newIndication and bias == -1 and ta.crossunder(close, indicationLevel)
+continuationSignal = continuationLong or continuationShort
+
+if continuationSignal
+    pendingContinuation := false
+
+// ============================================================================
+// PLOTS: Active swing high/low ("reaction levels")
+// ============================================================================
+
+plot(showStructureLine ? swingHigh : na, "Swing High (Reaction Level)", color=bearColor, style=plot.style_stepline, linewidth=1)
+plot(showStructureLine ? swingLow : na, "Swing Low (Reaction Level)", color=bullColor, style=plot.style_stepline, linewidth=1)
+
+// ============================================================================
+// SWING HIGH/LOW LABELS (HH / LH / EQH / HL / LL / EQL)
+// ============================================================================
+
+if showSwingLabels and not na(ph) and phClass != "H" and phClass != ""
+    labelColor = phClass == "HH" ? bullColor : phClass == "EQH" ? neutralColor : bearColor
+    label.new(bar_index - pivotLen, ph, phClass, style=label.style_label_down, color=labelColor, textcolor=color.white, size=size.tiny)
+
+if showSwingLabels and not na(pl) and plClass != "L" and plClass != ""
+    labelColor = plClass == "HL" ? bullColor : plClass == "EQL" ? neutralColor : bearColor
+    label.new(bar_index - pivotLen, pl, plClass, style=label.style_label_up, color=labelColor, textcolor=color.white, size=size.tiny)
+
+// ============================================================================
+// INDICATION LABELS + ORIGIN TARGET LINE
+// ============================================================================
+
+var line indicationLine = na
+var line originLine = na
+var label originLabel = na
+
+if newIndication and showIndication
+    txt = bias == 1 ? "INDICATION ▲" : "INDICATION ▼"
+    lblColor = bias == 1 ? bullColor : bearColor
+    lblStyle = bias == 1 ? label.style_label_up : label.style_label_down
+    label.new(bar_index, bias == 1 ? low : high, txt, style=lblStyle, color=lblColor, textcolor=color.white, size=size.small)
+
+    if not na(indicationLine)
+        line.delete(indicationLine)
+    indicationLine := line.new(bar_index, indicationLevel, bar_index + 1, indicationLevel, extend=extend.right, color=lblColor, style=line.style_dotted, width=1)
+
+    if showTargets
+        if not na(originLine)
+            line.delete(originLine)
+        if not na(originLabel)
+            label.delete(originLabel)
+        originLine := line.new(bar_index, originLevel, bar_index + 1, originLevel, extend=extend.right, color=color.new(lblColor, 40), style=line.style_dashed, width=1)
+        originLabel := label.new(bar_index, originLevel, "TARGET (origin)", style=label.style_label_left, color=color.new(lblColor, 70), textcolor=lblColor, size=size.tiny)
+
+// ============================================================================
+// CORRECTION ZONE SHADING
+// ============================================================================
+
+correctionActive = pendingContinuation and correctionStarted and not continuationSignal
+bgcolor(showCorrectionZone and correctionActive ? (bias == 1 ? color.new(bearColor, 88) : color.new(bullColor, 88)) : na, title="Correction Zone")
+
+// ============================================================================
+// CONTINUATION SIGNALS
+// ============================================================================
+
+plotshape(showContinuation and continuationLong ? low : na, "Continuation Buy", style=shape.triangleup, location=location.belowbar, color=bullColor, size=size.small)
+plotshape(showContinuation and continuationShort ? high : na, "Continuation Sell", style=shape.triangledown, location=location.abovebar, color=bearColor, size=size.small)
+
+// ============================================================================
+// SESSION HIGHLIGHT
+// ============================================================================
+
+inSession = not na(time(timeframe.period, sessionString))
+bgcolor(showSessionBg and inSession ? sessionColor : na, title="Session Highlight")
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+
+alertcondition(newIndication and bias == 1, "Bullish Indication", "TradesBySci ICC: bullish indication (break of swing high) on {{ticker}} {{interval}}")
+alertcondition(newIndication and bias == -1, "Bearish Indication", "TradesBySci ICC: bearish indication (break of swing low) on {{ticker}} {{interval}}")
+alertcondition(continuationLong, "Continuation Buy", "TradesBySci ICC: bullish continuation (2nd push) on {{ticker}} {{interval}}")
+alertcondition(continuationShort, "Continuation Sell", "TradesBySci ICC: bearish continuation (2nd push) on {{ticker}} {{interval}}")
